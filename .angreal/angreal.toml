@@ -1,0 +1,6 @@
+author_email = "wadkar.sameer@gmail.com"
+author_name = "Sameer Wadkar"
+package_name = "benchmarks"
+project_name = "pytorch-gpu-anatomy"
+project_short_description = "pytorch-gpu-anatomy"
+project_slug = "pytorch-gpu-anatomy"
