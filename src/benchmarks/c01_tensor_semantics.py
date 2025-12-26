@@ -2,7 +2,7 @@ import argparse
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -198,51 +198,100 @@ def run_contiguity_bench(
 # Experiment 3: Sync points (where PyTorch forces CPU↔GPU sync)
 # -----------------------------
 def run_sync_points(device_str: str, dtype_str: str, iters: int):
+    """
+    Demonstrates:
+      1) Async enqueue vs per-iter synchronize
+         - BIG GEMM: sync overhead amortized
+         - SMALL GEMM: sync overhead dominates
+      2) Implicit sync points (.item(), print) when GPU work is pending
+      3) Scalar read cost after explicit synchronize
+
+    Prints timings in both ms and µs for intuition.
+    """
+    import time
+
     device = torch.device(device_str)
     require_cuda(device_str)
     dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float32}[dtype_str]
 
-    x = torch.randn(8192, 8192, device=device, dtype=dtype)
-    w = torch.randn(8192, 8192, device=device, dtype=dtype)
+    # Problem sizes
+    big = 8192
+    small = 512
+
+    x_big = torch.randn(big, big, device=device, dtype=dtype)
+    w_big = torch.randn(big, big, device=device, dtype=dtype)
+
+    x_small = torch.randn(small, small, device=device, dtype=dtype)
+    w_small = torch.randn(small, small, device=device, dtype=dtype)
 
     def heavy_op():
-        y = x @ w
-        # keep it alive
-        return y
+        return x_big @ w_big
 
-    # 1) Async enqueue timing (no explicit sync each iter)
-    def fn_async():
-        _ = heavy_op()
+    def small_op():
+        return x_small @ w_small
 
-    t_async = time_cuda(fn_async, warmup=5, iters=iters, sync_each_iter=False)
-    print(f'\nAsync (no per-iter sync): {t_async.per_iter_ms:.4f} ms/iter')
+    def fmt(ms: float) -> str:
+        """
+        Format milliseconds with a microsecond view for small values.
+        """
+        if ms < 1.0:
+            return f'{ms:.4f} ms  ({ms * 1000.0:.1f} µs)'
+        return f'{ms:.4f} ms'
 
-    # 2) Force worst-case: sync every iteration
-    t_sync = time_cuda(fn_async, warmup=5, iters=iters, sync_each_iter=True)
-    print(f'Forced sync each iter:    {t_sync.per_iter_ms:.4f} ms/iter')
+    def bench_pair(name: str, op):
+        def fn_async():
+            _ = op()
 
-    # 3) Common implicit syncs
+        t_async = time_cuda(fn_async, warmup=5, iters=iters, sync_each_iter=False)
+        t_sync = time_cuda(fn_async, warmup=5, iters=iters, sync_each_iter=True)
+
+        delta = t_sync.per_iter_ms - t_async.per_iter_ms
+        pct = (delta / t_async.per_iter_ms * 100.0) if t_async.per_iter_ms > 0 else float('nan')
+
+        print(f'\n=== {name} ===')
+        print(f'Async (no per-iter sync): {fmt(t_async.per_iter_ms)}')
+        print(f'Forced sync each iter:    {fmt(t_sync.per_iter_ms)}')
+        print(f'Delta:                   {fmt(delta)}  ({pct:.2f}%)')
+
+    # ------------------------------------------------------------------
+    # 1) Async vs sync: big vs small kernels
+    # ------------------------------------------------------------------
+    bench_pair(f'BIG GEMM ({big}x{big} @ {big}x{big})', heavy_op)
+    bench_pair(f'SMALL GEMM ({small}x{small} @ {small}x{small})', small_op)
+
+    # ------------------------------------------------------------------
+    # 2) Implicit sync demos (measure the *stall*)
+    # ------------------------------------------------------------------
+    print('\n=== Implicit sync demos (stall when work is pending) ===')
+
     y = heavy_op()
-    torch.cuda.synchronize()
-
-    # .item() forces sync because CPU needs the scalar
     t0 = time.perf_counter()
-    s = y[0, 0].item()
+    s = y[0, 0].item()  # forces sync + device->host copy if GEMM not finished
     t1 = time.perf_counter()
-    print(f'\n.item() sync cost: {(t1 - t0) * 1000:.3f} ms  (value={s:.5f})')
+    print(f'.item() (includes stall): {(t1 - t0) * 1000.0:.3f} ms  (value={s:.5f})')
 
-    # Printing a CUDA tensor also tends to sync (or trigger device->host copy)
-    # We'll show the cost by timing a minimal print of a single element.
     y2 = heavy_op()
+    t0 = time.perf_counter()
+    print(f'print triggers: {y2[0, 0]}')  # forces sync + D2H
+    t1 = time.perf_counter()
+    print(f'print (includes stall):   {(t1 - t0) * 1000.0:.3f} ms')
+
+    # ------------------------------------------------------------------
+    # 3) Scalar read after explicit sync (pure D2H + Python overhead)
+    # ------------------------------------------------------------------
+    print('\n=== Scalar read after explicit synchronize (no pending GPU work) ===')
+
+    y3 = heavy_op()
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    print(f'print triggers: {y2[0, 0]}')
+    s2 = y3[0, 0].item()
     t1 = time.perf_counter()
-    print(f'print cost: {(t1 - t0) * 1000:.3f} ms')
+    print(f'.item() (after sync):     {(t1 - t0) * 1000.0:.3f} ms  (value={s2:.5f})')
 
     print('\nTakeaway:')
     print('  - CUDA ops are queued asynchronously.')
-    print('  - Anything that needs a CPU value (item/print/cpu()/numpy()) forces a sync.')
+    print('  - Per-iter torch.cuda.synchronize() hurts most when kernels are small/fast.')
+    print('  - item()/print/cpu()/numpy() force a sync if they touch results from pending GPU work.')
 
 
 # -----------------------------
@@ -276,15 +325,11 @@ class TinyTransformerBlock(nn.Module):
         return x
 
 
-def walk_grad_fn(fn, max_nodes: int = 50):
-    """
-    BFS over .grad_fn -> .next_functions
-    """
-
-    q: deque[int] = deque()
-    seen = set()
+def walk_grad_fn(fn: Any, max_nodes: int = 50) -> list[Any]:
+    q: deque[Any] = deque()
+    seen: set[int] = set()
     q.append(fn)
-    out: list[int] = []
+    out: list[Any] = []
     while q and len(out) < max_nodes:
         cur = q.popleft()
         if cur is None:
@@ -312,7 +357,7 @@ def run_autograd_inspect(device_str: str, dtype_str: str, b: int, t: int, d: int
     loss.backward()
 
     print('\n=== grad_fn tree (loss.grad_fn) ===')
-    nodes = walk_grad_fn(loss.grad_fn, max_nodes=60)
+    nodes = walk_grad_fn(loss.grad_fn, max_nodes=50)
     for i, n in enumerate(nodes):
         name = n.__class__.__name__
         print(f'{i:02d}: {name}')
